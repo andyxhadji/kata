@@ -11,7 +11,10 @@ import (
 )
 
 func newReadyCmd() *cobra.Command {
-	var limit int
+	var (
+		limit int
+		all   bool
+	)
 	cmd := &cobra.Command{
 		Use:   "ready",
 		Short: "list open issues with no open blocks predecessor",
@@ -20,16 +23,15 @@ func newReadyCmd() *cobra.Command {
 			if limit < 0 {
 				return &cliError{Message: "--limit must be non-negative", Kind: kindValidation, ExitCode: ExitValidation}
 			}
+			if all && flags.Project != "" {
+				return &cliError{
+					Message:  "--project and --all are mutually exclusive",
+					Kind:     kindValidation,
+					ExitCode: ExitValidation,
+				}
+			}
 			ctx := cmd.Context()
-			start, err := resolveStartPath(flags.Workspace)
-			if err != nil {
-				return err
-			}
 			baseURL, err := ensureDaemon(ctx)
-			if err != nil {
-				return err
-			}
-			pid, err := resolveProjectID(ctx, baseURL, start)
 			if err != nil {
 				return err
 			}
@@ -37,10 +39,25 @@ func newReadyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			getURL := fmt.Sprintf("%s/api/v1/projects/%d/ready", baseURL, pid)
+
+			var getURL string
+			if all {
+				getURL = baseURL + "/api/v1/ready"
+			} else {
+				start, err := resolveStartPath(flags.Workspace)
+				if err != nil {
+					return err
+				}
+				pid, err := resolveProjectID(ctx, baseURL, start)
+				if err != nil {
+					return err
+				}
+				getURL = fmt.Sprintf("%s/api/v1/projects/%d/ready", baseURL, pid)
+			}
 			if limit > 0 {
 				getURL += fmt.Sprintf("?limit=%d", limit)
 			}
+
 			status, bs, err := httpDoJSON(ctx, client, http.MethodGet, getURL, nil)
 			if err != nil {
 				return err
@@ -56,6 +73,33 @@ func newReadyCmd() *cobra.Command {
 				_, err := fmt.Fprint(cmd.OutOrStdout(), buf.String())
 				return err
 			}
+
+			if all {
+				var b struct {
+					Issues []struct {
+						ShortID     string  `json:"short_id"`
+						Title       string  `json:"title"`
+						Owner       *string `json:"owner,omitempty"`
+						ProjectName string  `json:"project_name"`
+					} `json:"issues"`
+				}
+				if err := json.Unmarshal(bs, &b); err != nil {
+					return err
+				}
+				for _, i := range b.Issues {
+					owner := "-"
+					if i.Owner != nil {
+						owner = *i.Owner
+					}
+					qualified := i.ProjectName + "#" + i.ShortID
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%-16s  %s  (%s)\n",
+						qualified, textsafe.Line(i.Title), textsafe.Line(owner)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+
 			var b struct {
 				Issues []struct {
 					ShortID string  `json:"short_id"`
@@ -80,5 +124,6 @@ func newReadyCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "max rows (0 = no limit)")
+	cmd.Flags().BoolVar(&all, "all", false, "list ready issues across all non-archived projects")
 	return cmd
 }
