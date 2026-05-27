@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/kata/internal/textsafe"
@@ -23,11 +24,11 @@ func newReadyCmd() *cobra.Command {
 			if limit < 0 {
 				return &cliError{Message: "--limit must be non-negative", Kind: kindValidation, ExitCode: ExitValidation}
 			}
-			if all && flags.Project != "" {
+			if all && strings.TrimSpace(flags.Project) != "" {
 				return &cliError{
 					Message:  "--project and --all are mutually exclusive",
-					Kind:     kindValidation,
-					ExitCode: ExitValidation,
+					Kind:     kindUsage,
+					ExitCode: ExitUsage,
 				}
 			}
 			ctx := cmd.Context()
