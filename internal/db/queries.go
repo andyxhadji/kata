@@ -1467,7 +1467,7 @@ func (d *DB) ReadyIssuesGlobal(ctx context.Context, limit int) ([]ReadyGlobalIss
 			&r.Issue.CreatedAt, &r.Issue.UpdatedAt, &r.Issue.ClosedAt, &r.Issue.DeletedAt,
 			&r.ProjectName,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan ready global issue: %w", err)
 		}
 		out = append(out, r)
 	}
