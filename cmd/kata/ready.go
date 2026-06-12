@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/kata/internal/textsafe"
@@ -12,6 +13,11 @@ import (
 
 func newReadyCmd() *cobra.Command {
 	var limit int
+	var unowned bool
+	var owner string
+	var labels []string
+	var noLabels []string
+
 	cmd := &cobra.Command{
 		Use:   "ready",
 		Short: "list open issues with no open blocks predecessor",
@@ -19,6 +25,9 @@ func newReadyCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if limit < 0 {
 				return &cliError{Message: "--limit must be non-negative", Kind: kindValidation, ExitCode: ExitValidation}
+			}
+			if unowned && owner != "" {
+				return &cliError{Message: "--unowned and --owner are mutually exclusive", Kind: kindValidation, ExitCode: ExitValidation}
 			}
 			ctx := cmd.Context()
 			start, err := resolveStartPath(flags.Workspace)
@@ -37,9 +46,30 @@ func newReadyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Build base URL
 			getURL := fmt.Sprintf("%s/api/v1/projects/%d/ready", baseURL, pid)
+
+			// Build query parameters
+			params := url.Values{}
 			if limit > 0 {
-				getURL += fmt.Sprintf("?limit=%d", limit)
+				params.Set("limit", fmt.Sprintf("%d", limit))
+			}
+			if unowned {
+				params.Set("unowned", "true")
+			}
+			if owner != "" {
+				params.Set("owner", owner)
+			}
+			for _, l := range labels {
+				params.Add("label", l)
+			}
+			for _, l := range noLabels {
+				params.Add("exclude_label", l)
+			}
+
+			// Append query string if params exist
+			if len(params) > 0 {
+				getURL += "?" + params.Encode()
 			}
 			status, bs, err := httpDoJSON(ctx, client, http.MethodGet, getURL, nil)
 			if err != nil {
@@ -67,12 +97,12 @@ func newReadyCmd() *cobra.Command {
 				return err
 			}
 			for _, i := range b.Issues {
-				owner := "-"
+				ownerStr := "-"
 				if i.Owner != nil {
-					owner = *i.Owner
+					ownerStr = *i.Owner
 				}
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%-8s  %s  (%s)\n",
-					i.ShortID, textsafe.Line(i.Title), textsafe.Line(owner)); err != nil {
+					i.ShortID, textsafe.Line(i.Title), textsafe.Line(ownerStr)); err != nil {
 					return err
 				}
 			}
@@ -80,5 +110,9 @@ func newReadyCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "max rows (0 = no limit)")
+	cmd.Flags().BoolVar(&unowned, "unowned", false, "only issues with no owner")
+	cmd.Flags().StringVar(&owner, "owner", "", "only issues owned by this actor")
+	cmd.Flags().StringSliceVar(&labels, "label", nil, "only issues with this label (repeatable, AND logic)")
+	cmd.Flags().StringSliceVar(&noLabels, "no-label", nil, "exclude issues with this label (repeatable)")
 	return cmd
 }

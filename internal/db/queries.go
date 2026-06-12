@@ -813,11 +813,15 @@ func (d *DB) IssueUIDPrefixMatch(ctx context.Context, prefix string, limit int, 
 // with NULL priority match neither filter — they only surface when both are
 // nil.
 type ListIssuesParams struct {
-	ProjectID   int64
-	Status      string // "open" | "closed" | "" (any)
-	Priority    *int64 // nil = no filter; non-nil = exactly this value
-	MaxPriority *int64 // nil = no filter; non-nil = priority <= MaxPriority
-	Limit       int    // 0 = no limit
+	ProjectID     int64
+	Status        string   // "open" | "closed" | "" (any)
+	Priority      *int64   // nil = no filter; non-nil = exactly this value
+	MaxPriority   *int64   // nil = no filter; non-nil = priority <= MaxPriority
+	Limit         int      // 0 = no limit
+	Unowned       bool     // only issues where owner IS NULL
+	Owner         string   // only issues where owner = this value (empty = no filter)
+	Labels        []string // issues must have ALL these labels (AND logic)
+	ExcludeLabels []string // issues must NOT have any of these labels
 }
 
 // ListIssues returns issues in the given project, excluding soft-deleted rows.
@@ -835,6 +839,23 @@ func (d *DB) ListIssues(ctx context.Context, p ListIssuesParams) ([]Issue, error
 	if p.MaxPriority != nil {
 		q += ` AND i.priority IS NOT NULL AND i.priority <= ?`
 		args = append(args, *p.MaxPriority)
+	}
+	// Apply owner filters
+	if p.Unowned {
+		q += ` AND i.owner IS NULL`
+	} else if p.Owner != "" {
+		q += ` AND i.owner = ?`
+		args = append(args, p.Owner)
+	}
+	// Apply label filters (must have ALL these labels)
+	for _, label := range p.Labels {
+		q += ` AND EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_id = i.id AND il.label = ?)`
+		args = append(args, strings.ToLower(label))
+	}
+	// Apply exclude label filters (must NOT have any of these labels)
+	for _, label := range p.ExcludeLabels {
+		q += ` AND NOT EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_id = i.id AND il.label = ?)`
+		args = append(args, strings.ToLower(label))
 	}
 	q += ` ORDER BY i.updated_at DESC, i.id DESC`
 	if p.Limit > 0 {
@@ -1398,9 +1419,141 @@ func ownerEqual(a, b *string) bool {
 	return *a == *b
 }
 
+// ErrAlreadyClaimed is returned by ClaimOwner when the issue is already owned
+// by a different actor and force is false.
+var ErrAlreadyClaimed = errors.New("already claimed")
+
+// ClaimResult contains the result of a ClaimOwner operation.
+type ClaimResult struct {
+	Issue         Issue
+	Event         *Event
+	Changed       bool
+	PreviousOwner *string
+	CurrentOwner  *string // set when ErrAlreadyClaimed is returned
+}
+
+// ClaimOwner atomically claims an issue for the given actor. The conditional
+// UPDATE ensures the claim only succeeds if the issue is unowned or owned by
+// the same actor (or force is true). If a concurrent claim causes a SQLite
+// busy/locked error during the UPDATE, we treat it as a conflict and return
+// ErrAlreadyClaimed after fetching the current owner.
+//
+// Returns ErrAlreadyClaimed if the issue is already owned by a different actor
+// and force is false. The ClaimResult.CurrentOwner field is set in this case.
+func (d *DB) ClaimOwner(ctx context.Context, issueID int64, actor string, force bool) (ClaimResult, error) {
+	actor = strings.TrimSpace(actor)
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Read current state to get previous owner and check for no-op
+	issue, projectName, err := lookupIssueForEvent(ctx, tx, issueID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+
+	// Already owned by same actor: no-op
+	if issue.Owner != nil && *issue.Owner == actor {
+		if err := tx.Commit(); err != nil {
+			return ClaimResult{}, err
+		}
+		return ClaimResult{
+			Issue:         issue,
+			Event:         nil,
+			Changed:       false,
+			PreviousOwner: nil,
+		}, nil
+	}
+
+	// Store previous owner before update
+	var previousOwner *string
+	if issue.Owner != nil {
+		prev := *issue.Owner
+		previousOwner = &prev
+	}
+
+	// Conditional UPDATE: only succeeds if ownership state matches expectations.
+	// The WHERE clause prevents races - if another request claimed between our
+	// read and this write, zero rows will be affected.
+	var res sql.Result
+	if force {
+		res, err = tx.ExecContext(ctx,
+			`UPDATE issues
+			 SET owner      = ?,
+			     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id = ? AND deleted_at IS NULL`, actor, issueID)
+	} else {
+		res, err = tx.ExecContext(ctx,
+			`UPDATE issues
+			 SET owner      = ?,
+			     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id = ? AND deleted_at IS NULL AND (owner IS NULL OR owner = ?)`, actor, issueID, actor)
+	}
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("update owner: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("rows affected: %w", err)
+	}
+
+	// Zero rows affected means the conditional WHERE didn't match:
+	// someone else claimed the issue between our read and write.
+	if rowsAffected == 0 {
+		return ClaimResult{CurrentOwner: issue.Owner}, ErrAlreadyClaimed
+	}
+
+	// Re-read the updated issue for response
+	issue, _, err = lookupIssueForEvent(ctx, tx, issueID)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+
+	// Emit assigned event
+	bs, marshalErr := json.Marshal(struct {
+		Owner string `json:"owner"`
+	}{Owner: actor})
+	if marshalErr != nil {
+		return ClaimResult{}, fmt.Errorf("marshal assigned payload: %w", marshalErr)
+	}
+	evt, err := d.insertEventTx(ctx, tx, eventInsert{
+		ProjectID:   issue.ProjectID,
+		ProjectName: projectName,
+		IssueID:     &issue.ID,
+		Type:        "issue.assigned",
+		Actor:       actor,
+		Payload:     string(bs),
+	})
+	if err != nil {
+		return ClaimResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return ClaimResult{}, err
+	}
+
+	return ClaimResult{
+		Issue:         issue,
+		Event:         &evt,
+		Changed:       true,
+		PreviousOwner: previousOwner,
+	}, nil
+}
+
+// ReadyIssuesFilter holds optional filters for the ready query.
+type ReadyIssuesFilter struct {
+	Unowned       bool     // only issues where owner IS NULL
+	Owner         string   // only issues where owner = this value (empty = no filter)
+	Labels        []string // issues must have ALL these labels (AND logic)
+	ExcludeLabels []string // issues must NOT have any of these labels
+}
+
 // ReadyIssues returns open, non-deleted issues with no open `blocks` predecessor,
 // ordered by updated_at DESC. limit==0 means no limit.
-func (d *DB) ReadyIssues(ctx context.Context, projectID int64, limit int) ([]Issue, error) {
+func (d *DB) ReadyIssues(ctx context.Context, projectID int64, limit int, filter ReadyIssuesFilter) ([]Issue, error) {
 	q := issueSelect + `
 		WHERE i.project_id = ? AND i.status = 'open' AND i.deleted_at IS NULL
 		  AND NOT EXISTS (
@@ -1408,9 +1561,30 @@ func (d *DB) ReadyIssues(ctx context.Context, projectID int64, limit int) ([]Iss
 		    JOIN issues blocker ON blocker.id = l.from_issue_id
 		    WHERE l.type = 'blocks' AND l.to_issue_id = i.id
 		      AND blocker.status = 'open' AND blocker.deleted_at IS NULL
-		  )
-		ORDER BY i.updated_at DESC, i.id DESC`
+		  )`
 	args := []any{projectID}
+
+	// Apply owner filters
+	if filter.Unowned {
+		q += ` AND i.owner IS NULL`
+	} else if filter.Owner != "" {
+		q += ` AND i.owner = ?`
+		args = append(args, filter.Owner)
+	}
+
+	// Apply label filters (must have ALL these labels)
+	for _, label := range filter.Labels {
+		q += ` AND EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_id = i.id AND il.label = ?)`
+		args = append(args, strings.ToLower(label))
+	}
+
+	// Apply exclude label filters (must NOT have any of these labels)
+	for _, label := range filter.ExcludeLabels {
+		q += ` AND NOT EXISTS (SELECT 1 FROM issue_labels il WHERE il.issue_id = i.id AND il.label = ?)`
+		args = append(args, strings.ToLower(label))
+	}
+
+	q += ` ORDER BY i.updated_at DESC, i.id DESC`
 	if limit > 0 {
 		q += fmt.Sprintf(` LIMIT %d`, limit)
 	}

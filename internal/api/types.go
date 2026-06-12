@@ -257,11 +257,15 @@ type MutationResponse struct {
 // survives Huma's query parsing (which forbids pointer query types). Empty
 // string means no filter; otherwise parsed as 0..4.
 type ListIssuesRequest struct {
-	ProjectID   int64  `path:"project_id" required:"true"`
-	Status      string `query:"status,omitempty" enum:"open,closed,"`
-	Priority    string `query:"priority,omitempty" doc:"exact priority filter (0..4); empty = no filter"`
-	MaxPriority string `query:"max_priority,omitempty" doc:"include only priority <= this value (0..4); empty = no filter"`
-	Limit       int    `query:"limit,omitempty"`
+	ProjectID     int64    `path:"project_id" required:"true"`
+	Status        string   `query:"status,omitempty" enum:"open,closed,"`
+	Priority      string   `query:"priority,omitempty" doc:"exact priority filter (0..4); empty = no filter"`
+	MaxPriority   string   `query:"max_priority,omitempty" doc:"include only priority <= this value (0..4); empty = no filter"`
+	Limit         int      `query:"limit,omitempty"`
+	Unowned       bool     `query:"unowned,omitempty"`
+	Owner         string   `query:"owner,omitempty"`
+	Labels        []string `query:"label,omitempty"`
+	ExcludeLabels []string `query:"exclude_label,omitempty"`
 }
 
 // ListAllIssuesRequest is GET /api/v1/issues — the cross-project list. The
@@ -636,10 +640,34 @@ type UnassignRequest struct {
 	}
 }
 
+// ClaimRequest is POST /api/v1/projects/{id}/issues/{ref}/actions/claim.
+type ClaimRequest struct {
+	ProjectID int64  `path:"project_id" required:"true"`
+	Ref       string `path:"ref" required:"true"`
+	Body      struct {
+		Actor string `json:"actor" required:"true"`
+		Force bool   `json:"force,omitempty"`
+	}
+}
+
+// ClaimResponse is the response for POST /api/v1/projects/{id}/issues/{ref}/actions/claim.
+type ClaimResponse struct {
+	Body struct {
+		Issue         db.Issue  `json:"issue"`
+		Event         *db.Event `json:"event,omitempty"`
+		Changed       bool      `json:"changed"`
+		PreviousOwner *string   `json:"previous_owner,omitempty"`
+	}
+}
+
 // ReadyRequest is GET /api/v1/projects/{id}/ready.
 type ReadyRequest struct {
-	ProjectID int64 `path:"project_id" required:"true"`
-	Limit     int   `query:"limit,omitempty"`
+	ProjectID     int64    `path:"project_id" required:"true"`
+	Limit         int      `query:"limit,omitempty"`
+	Unowned       bool     `query:"unowned,omitempty"`
+	Owner         string   `query:"owner,omitempty"`
+	Labels        []string `query:"label,omitempty"`
+	ExcludeLabels []string `query:"exclude_label,omitempty"`
 }
 
 // ReadyResponse is the ready-issue list.
